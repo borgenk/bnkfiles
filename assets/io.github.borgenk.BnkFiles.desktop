@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bnkfiles
+Comment=File explorer with a first-class image viewer
+Exec=bnkfiles %f
+Icon=system-file-manager
+Terminal=false
+StartupNotify=false
+Categories=System;FileTools;FileManager;Graphics;Viewer;
+MimeType=inode/directory;image/png;image/jpeg;image/gif;image/bmp;image/webp;

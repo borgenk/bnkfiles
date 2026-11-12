@@ -1,0 +1,5 @@
+decode_bmp_1024x768	499300	1
+downscale_2048_to_320	11119832	1
+frame_batch	1888	9
+thumb_cache_load_1k	24680316	2001
+scan_merge_10k	9960000	40065

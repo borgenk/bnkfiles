@@ -1,0 +1,6 @@
+# An exact release, not the floating `stable`: clippy runs with warnings denied,
+# so a new compiler's lints would otherwise fail a check of a commit nobody
+# touched.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

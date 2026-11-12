@@ -1,0 +1,780 @@
+//! The Vulkan backend's device layer: the part of the Vulkan C ABI the
+//! presentation path uses, declared in Rust (`abi`), and the bring-up that turns
+//! the compositor's dmabuf feedback into a live device and queue.
+//!
+//! The loader is `dlopen`ed rather than linked, so on a machine without Vulkan
+//! the binary still starts and exits with a clear message instead of failing at
+//! load time (the GPU is mandatory, there is no software renderer); every
+//! function pointer is fetched through `vkGetInstanceProcAddr` /
+//! `vkGetDeviceProcAddr` as the spec prescribes. There is no window surface or
+//! swapchain: frames reach the compositor as dmabufs over the Wayland wire, so
+//! no WSI extension is used.
+//!
+//! Structs and constants keep Vulkan's names, `Vk`/`VK_` prefix included, so
+//! they grep against the spec; fields are snake_case. Only the structure types,
+//! results and flags in use are declared. Layouts follow the x86_64/arm64 C ABI,
+//! and the size tests in `abi` pin them.
+
+mod abi;
+mod renderer;
+mod target;
+
+use core::ffi::{c_char, CStr};
+
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi::DynLib;
+use crate::render::gpu::TextureKey;
+use crate::render::vulkan::abi::*;
+use crate::render::vulkan::renderer::{create_renderer, Renderer};
+
+pub(crate) use crate::render::vulkan::target::{GpuImage, RenderTarget};
+
+// ---------------------------------------------------------------------------
+// Owned handles.
+// ---------------------------------------------------------------------------
+
+/// The instance and its destructor, so any error after creation still tears it
+/// down on drop.
+struct Instance {
+    raw: VkInstance,
+    destroy: PfnDestroyInstance,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // SAFETY: raw came from vkCreateInstance and is destroyed exactly once,
+        // after every object created from it (field order in Gpu).
+        unsafe { (self.destroy)(self.raw, core::ptr::null()) };
+    }
+}
+
+/// The logical device and its destructor.
+struct Device {
+    raw: VkDevice,
+    destroy: PfnDestroyDevice,
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // SAFETY: raw came from vkCreateDevice and is destroyed exactly once.
+        unsafe { (self.destroy)(self.raw, core::ptr::null()) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bring-up.
+// ---------------------------------------------------------------------------
+
+/// A live Vulkan device matched to the compositor's main DRM device, with a
+/// graphics queue, a command pool, and the format/memory facts the render
+/// targets need. Every failure on the way here is a clean `Err`, which ends
+/// startup with its message: there is no other renderer.
+pub struct Gpu {
+    fns: DeviceFns,
+    queue: VkQueue,
+    queue_family: u32,
+    pool: VkCommandPool,
+    renderer: Renderer,
+    /// The modifiers a presentable image can be laid out with on this device
+    /// (one plane, drawable through the sRGB view), to intersect with the
+    /// compositor's list.
+    modifiers: Vec<VkDrmFormatModifierPropertiesEXT>,
+    /// Property flags per memory type index, for allocation.
+    memory_type_flags: Vec<u32>,
+    /// The chosen device's DRM render-node minor, for opening a fd to create
+    /// explicit-sync sync objects. `None` if the device exposes no render node.
+    render_node: Option<u32>,
+    /// The device's `maxImageDimension2D`: no image or texture may be wider or
+    /// taller, so one that would be is skipped instead of failing creation.
+    max_image_dimension: u32,
+    /// Image-texture uploads given up on (see `Gpu::dropped_image_uploads`).
+    dropped_image_uploads: u64,
+    // Drop order is field order: the device before the instance, the instance
+    // before the loader library. The underscored two are pure keep-alives.
+    device: Device,
+    _instance: Instance,
+    _lib: DynLib,
+    name: String,
+}
+
+impl Gpu {
+    /// Bring up Vulkan against the DRM device `main_device` (a dev_t from the
+    /// compositor's dmabuf feedback): load the loader, create an instance, pick
+    /// the physical device matching that DRM identity, and create a one-queue
+    /// logical device with the dmabuf presentation extensions.
+    pub fn new(main_device: u64) -> Result<Self> {
+        let lib = DynLib::open(c"libvulkan.so.1")?;
+        let gipa_ptr = lib
+            .sym(c"vkGetInstanceProcAddr")
+            .ok_or_else(|| Error::msg("libvulkan.so.1 lacks vkGetInstanceProcAddr"))?;
+        // SAFETY: the loader exports vkGetInstanceProcAddr with exactly this
+        // signature; the pointer stays valid while `lib` lives.
+        let gipa: PfnGetInstanceProcAddr = unsafe { core::mem::transmute(gipa_ptr) };
+
+        let instance = create_instance(gipa)?;
+
+        // SAFETY (all loads below): the names match the transcribed PFN types.
+        let enumerate: PfnEnumeratePhysicalDevices =
+            unsafe { load(gipa, instance.raw, c"vkEnumeratePhysicalDevices") }?;
+        let get_props2: PfnGetPhysicalDeviceProperties2 =
+            unsafe { load(gipa, instance.raw, c"vkGetPhysicalDeviceProperties2") }?;
+        let enumerate_exts: PfnEnumerateDeviceExtensionProperties =
+            unsafe { load(gipa, instance.raw, c"vkEnumerateDeviceExtensionProperties") }?;
+        let get_queue_families: PfnGetPhysicalDeviceQueueFamilyProperties = unsafe {
+            load(
+                gipa,
+                instance.raw,
+                c"vkGetPhysicalDeviceQueueFamilyProperties",
+            )
+        }?;
+        let create_device: PfnCreateDevice =
+            unsafe { load(gipa, instance.raw, c"vkCreateDevice") }?;
+        let gdpa: PfnGetDeviceProcAddr =
+            unsafe { load(gipa, instance.raw, c"vkGetDeviceProcAddr") }?;
+        let get_memory_props: PfnGetPhysicalDeviceMemoryProperties =
+            unsafe { load(gipa, instance.raw, c"vkGetPhysicalDeviceMemoryProperties") }?;
+        let get_format_props2: PfnGetPhysicalDeviceFormatProperties2 =
+            unsafe { load(gipa, instance.raw, c"vkGetPhysicalDeviceFormatProperties2") }?;
+
+        let physicals = enumerate_physicals(enumerate, instance.raw)?;
+        let PickedDevice {
+            physical,
+            name,
+            queue_family,
+            render_node,
+            max_image_dimension,
+        } = pick_device(
+            get_props2,
+            enumerate_exts,
+            get_queue_families,
+            &physicals,
+            main_device,
+        )?;
+
+        let modifiers = render_modifiers(get_format_props2, physical);
+        if modifiers.is_empty() {
+            return Err(Error::msg(format!(
+                "device {name} offers no usable DRM modifier for B8G8R8A8"
+            )));
+        }
+        let memory_type_flags = memory_type_flags(get_memory_props, physical);
+
+        let device = create_logical_device(create_device, gdpa, physical, queue_family)?;
+        let fns = DeviceFns::load(gdpa, device.raw)?;
+
+        let get_queue: PfnGetDeviceQueue =
+            unsafe { load_device(gdpa, device.raw, c"vkGetDeviceQueue") }?;
+        let mut queue: VkQueue = core::ptr::null_mut();
+        // SAFETY: device is live and queue_family/index 0 were created with it.
+        unsafe { get_queue(device.raw, queue_family, 0, &mut queue) };
+        if queue.is_null() {
+            return Err(Error::msg("vkGetDeviceQueue returned null"));
+        }
+
+        let pool_info = VkCommandPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            queue_family_index: queue_family,
+        };
+        let mut pool: VkCommandPool = 0;
+        // SAFETY: device is live; pool_info is fully initialized.
+        check(
+            unsafe {
+                (fns.create_command_pool)(device.raw, &pool_info, core::ptr::null(), &mut pool)
+            },
+            "vkCreateCommandPool",
+        )?;
+
+        let renderer = match create_renderer(&fns, device.raw) {
+            Ok(r) => r,
+            Err(e) => {
+                // SAFETY: pool is live and nothing was ever submitted.
+                unsafe { (fns.destroy_command_pool)(device.raw, pool, core::ptr::null()) };
+                return Err(e);
+            }
+        };
+
+        Ok(Self {
+            fns,
+            queue,
+            queue_family,
+            pool,
+            renderer,
+            modifiers,
+            memory_type_flags,
+            render_node,
+            max_image_dimension,
+            dropped_image_uploads: 0,
+            device,
+            _instance: instance,
+            _lib: lib,
+            name,
+        })
+    }
+
+    /// The marketing name of the chosen device (for diagnostics).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The DRM render node minor of the chosen device (`/dev/dri/renderD<minor>`),
+    /// where explicit sync opens a fd to create its sync objects. `None` when the
+    /// device exposes no render node.
+    pub fn render_node(&self) -> Option<u32> {
+        self.render_node
+    }
+
+    pub fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+
+    /// The widest and tallest image this device can create, swap buffer or
+    /// texture. A picture larger than this on either side cannot be drawn.
+    pub fn max_image_dimension(&self) -> u32 {
+        self.max_image_dimension
+    }
+
+    /// The subset of the compositor's modifier list this device can render
+    /// into, in the compositor's (preference) order. `DRM_FORMAT_MOD_INVALID`
+    /// ("implicit layout") is dropped: explicit-modifier allocation is the
+    /// whole point of this path.
+    pub fn image_modifiers(&self, compositor: &[u64]) -> Vec<u64> {
+        compositor
+            .iter()
+            .copied()
+            .filter(|&m| m != DRM_FORMAT_MOD_INVALID)
+            .filter(|&m| self.modifiers.iter().any(|p| p.drm_format_modifier == m))
+            .collect()
+    }
+
+    /// Whether an image texture for `key` is already uploaded (the batcher
+    /// asks, and attaches bitmaps only for the ones this renderer lacks).
+    pub fn has_image(&self, key: &TextureKey) -> bool {
+        self.renderer.images.contains_key(key)
+    }
+
+    /// Block until the queue drains; teardown and resize use this so nothing
+    /// is destroyed while a frame is in flight.
+    pub fn wait_idle(&self) {
+        // SAFETY: device is live. The result only matters to callers about to
+        // destroy things, and a lost device makes destruction safe anyway.
+        let _ = unsafe { (self.fns.device_wait_idle)(self.device.raw) };
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.wait_idle();
+        let renderer = std::mem::take(&mut self.renderer);
+        renderer.destroy(&self.fns, self.device.raw);
+        // SAFETY: pool came from vkCreateCommandPool on this device; command
+        // buffers still allocated from it are freed with it.
+        unsafe { (self.fns.destroy_command_pool)(self.device.raw, self.pool, core::ptr::null()) };
+    }
+}
+
+/// The device's modifiers a presentable image can be laid out with.
+fn render_modifiers(
+    get_format_props2: PfnGetPhysicalDeviceFormatProperties2,
+    physical: VkPhysicalDevice,
+) -> Vec<VkDrmFormatModifierPropertiesEXT> {
+    usable_modifiers(
+        format_modifiers(get_format_props2, physical, VK_FORMAT_B8G8R8A8_UNORM),
+        &format_modifiers(get_format_props2, physical, VK_FORMAT_B8G8R8A8_SRGB),
+    )
+}
+
+/// The `store` modifiers a presentable image can be laid out with, given the
+/// device's modifiers for the sRGB `view` format. A modifier's features can
+/// differ between the two formats, and the image needs both: it is created in
+/// the store format and drawn through the view.
+fn usable_modifiers(
+    mut store: Vec<VkDrmFormatModifierPropertiesEXT>,
+    view: &[VkDrmFormatModifierPropertiesEXT],
+) -> Vec<VkDrmFormatModifierPropertiesEXT> {
+    // The image's own usage is the render-pass attachment and nothing else:
+    // nothing copies into or out of a swap image.
+    let store_needs = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    // The render pass draws through the view with blending on.
+    let view_needs =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    let has = |m: &VkDrmFormatModifierPropertiesEXT, needs: u32| {
+        m.drm_format_modifier_tiling_features & needs == needs
+    };
+    store.retain(|m| {
+        m.drm_format_modifier_plane_count == 1
+            && has(m, store_needs)
+            && view
+                .iter()
+                .any(|v| v.drm_format_modifier == m.drm_format_modifier && has(v, view_needs))
+    });
+    store
+}
+
+/// The device's modifiers for `format` and the features each supports (the
+/// two-call pattern over the chained modifier list).
+fn format_modifiers(
+    get_format_props2: PfnGetPhysicalDeviceFormatProperties2,
+    physical: VkPhysicalDevice,
+    format: u32,
+) -> Vec<VkDrmFormatModifierPropertiesEXT> {
+    let mut list = VkDrmFormatModifierPropertiesListEXT {
+        s_type: VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+        p_next: core::ptr::null_mut(),
+        drm_format_modifier_count: 0,
+        p_drm_format_modifier_properties: core::ptr::null_mut(),
+    };
+    let mut props = VkFormatProperties2 {
+        s_type: VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        p_next: (&mut list as *mut VkDrmFormatModifierPropertiesListEXT).cast(),
+        format_properties: VkFormatProperties {
+            linear_tiling_features: 0,
+            optimal_tiling_features: 0,
+            buffer_features: 0,
+        },
+    };
+    // SAFETY: physical is live; props chains one correctly-typed list struct.
+    unsafe { get_format_props2(physical, format, &mut props) };
+    let mut mods = vec![
+        VkDrmFormatModifierPropertiesEXT {
+            drm_format_modifier: 0,
+            drm_format_modifier_plane_count: 0,
+            drm_format_modifier_tiling_features: 0,
+        };
+        list.drm_format_modifier_count as usize
+    ];
+    list.p_drm_format_modifier_properties = mods.as_mut_ptr();
+    // SAFETY: the array now has room for the advertised count.
+    unsafe { get_format_props2(physical, format, &mut props) };
+    mods.truncate(list.drm_format_modifier_count as usize);
+    mods
+}
+
+/// Property flags per memory type index.
+fn memory_type_flags(
+    get_memory_props: PfnGetPhysicalDeviceMemoryProperties,
+    physical: VkPhysicalDevice,
+) -> Vec<u32> {
+    // SAFETY: zeroed VkPhysicalDeviceMemoryProperties (integers) is a valid
+    // out-parameter.
+    let mut props = unsafe { core::mem::zeroed::<VkPhysicalDeviceMemoryProperties>() };
+    // SAFETY: physical is live; props is sized per the ABI test.
+    unsafe { get_memory_props(physical, &mut props) };
+    props
+        .memory_types
+        .iter()
+        .take((props.memory_type_count as usize).min(32))
+        .map(|t| t.property_flags)
+        .collect()
+}
+
+/// The first memory type `allowed_bits` permits that carries every `required`
+/// property flag. With no requirement, prefer device-local and fall back to the
+/// first allowed type. `types` holds each type's property flags by index, as
+/// [`memory_type_flags`] reads them; a 32-bit mask names at most 32 of them.
+fn pick_memory_type(types: &[u32], allowed_bits: u32, required: u32) -> Option<u32> {
+    let mut allowed = (0u32..32)
+        .zip(types)
+        .filter(|&(i, _)| allowed_bits & (1 << i) != 0);
+    if required != 0 {
+        return allowed
+            .find(|&(_, &flags)| flags & required == required)
+            .map(|(i, _)| i);
+    }
+    allowed
+        .clone()
+        .find(|&(_, &flags)| flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0)
+        .or_else(|| allowed.next())
+        .map(|(i, _)| i)
+}
+
+fn create_instance(gipa: PfnGetInstanceProcAddr) -> Result<Instance> {
+    // SAFETY: vkCreateInstance is fetchable with a null instance.
+    let create: PfnCreateInstance =
+        unsafe { load(gipa, core::ptr::null_mut(), c"vkCreateInstance") }?;
+    let app = VkApplicationInfo {
+        s_type: VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        p_next: core::ptr::null(),
+        p_application_name: c"bnkfiles".as_ptr(),
+        application_version: 0,
+        p_engine_name: core::ptr::null(),
+        engine_version: 0,
+        api_version: API_VERSION_1_2,
+    };
+    let info = VkInstanceCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        p_application_info: &app,
+        enabled_layer_count: 0,
+        pp_enabled_layer_names: core::ptr::null(),
+        enabled_extension_count: 0,
+        pp_enabled_extension_names: core::ptr::null(),
+    };
+    let mut raw: VkInstance = core::ptr::null_mut();
+    // SAFETY: info and app are fully initialized and outlive the call.
+    check(
+        unsafe { create(&info, core::ptr::null(), &mut raw) },
+        "vkCreateInstance",
+    )?;
+    // Fetch the destructor immediately so every later error path tears the
+    // instance down through Instance's Drop.
+    let destroy: PfnDestroyInstance = unsafe { load(gipa, raw, c"vkDestroyInstance") }?;
+    Ok(Instance { raw, destroy })
+}
+
+fn enumerate_physicals(
+    enumerate: PfnEnumeratePhysicalDevices,
+    instance: VkInstance,
+) -> Result<Vec<VkPhysicalDevice>> {
+    // The standard two-call pattern; loop in case a device appears between the
+    // count and the fill (VK_INCOMPLETE).
+    loop {
+        let mut count = 0u32;
+        // SAFETY: instance is live; null array means "count only".
+        check(
+            unsafe { enumerate(instance, &mut count, core::ptr::null_mut()) },
+            "vkEnumeratePhysicalDevices (count)",
+        )?;
+        if count == 0 {
+            return Err(Error::msg("no vulkan physical devices"));
+        }
+        let mut devices = vec![core::ptr::null_mut(); count as usize];
+        // SAFETY: devices has room for count entries.
+        let r = unsafe { enumerate(instance, &mut count, devices.as_mut_ptr()) };
+        if r == VK_INCOMPLETE {
+            continue;
+        }
+        check(r, "vkEnumeratePhysicalDevices")?;
+        devices.truncate(count as usize);
+        return Ok(devices);
+    }
+}
+
+/// Read a NUL-terminated device or extension name out of a fixed C array.
+fn c_name(bytes: &[c_char]) -> String {
+    let unsigned: Vec<u8> = bytes.iter().map(|&c| c as u8).collect();
+    let end = unsigned
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(unsigned.len());
+    String::from_utf8_lossy(unsigned.get(..end).unwrap_or(&unsigned)).into_owned()
+}
+
+/// Whether `wanted` appears in the device's supported extension list.
+fn has_extension(exts: &[VkExtensionProperties], wanted: &CStr) -> bool {
+    exts.iter()
+        .any(|e| c_name(&e.extension_name).as_bytes() == wanted.to_bytes())
+}
+
+/// The physical device [`pick_device`] settled on, with the facts read off it.
+struct PickedDevice {
+    physical: VkPhysicalDevice,
+    /// The marketing name, for diagnostics.
+    name: String,
+    /// The graphics queue family index.
+    queue_family: u32,
+    /// The DRM render-node minor, if the device exposes a render node.
+    render_node: Option<u32>,
+    /// `VkPhysicalDeviceLimits::maxImageDimension2D`.
+    max_image_dimension: u32,
+}
+
+/// Pick the physical device whose DRM identity matches `main_device` and which
+/// offers a graphics queue and every required extension.
+fn pick_device(
+    get_props2: PfnGetPhysicalDeviceProperties2,
+    enumerate_exts: PfnEnumerateDeviceExtensionProperties,
+    get_queue_families: PfnGetPhysicalDeviceQueueFamilyProperties,
+    physicals: &[VkPhysicalDevice],
+    main_device: u64,
+) -> Result<PickedDevice> {
+    let (want_major, want_minor) = (
+        i64::from(crate::platform::dmabuf::dev_major(main_device)),
+        i64::from(crate::platform::dmabuf::dev_minor(main_device)),
+    );
+    let mut seen = Vec::new();
+
+    for &physical in physicals {
+        let mut drm = VkPhysicalDeviceDrmPropertiesEXT {
+            s_type: VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
+            p_next: core::ptr::null_mut(),
+            has_primary: 0,
+            has_render: 0,
+            primary_major: 0,
+            primary_minor: 0,
+            render_major: 0,
+            render_minor: 0,
+        };
+        // SAFETY: zeroed VkPhysicalDeviceProperties is a valid out-parameter;
+        // the struct layouts are guarded by the size tests below.
+        let mut props = unsafe { core::mem::zeroed::<VkPhysicalDeviceProperties2>() };
+        props.s_type = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+
+        let exts = enumerate_extensions(enumerate_exts, physical)?;
+        let name = if has_extension(&exts, EXT_PHYSICAL_DEVICE_DRM) {
+            props.p_next = (&mut drm as *mut VkPhysicalDeviceDrmPropertiesEXT).cast();
+            // SAFETY: physical is live; props chains one correctly-typed struct.
+            unsafe { get_props2(physical, &mut props) };
+            c_name(&props.properties.device_name)
+        } else {
+            // Without the DRM identity the device cannot be matched to the
+            // compositor's; note it for the error message and move on.
+            // SAFETY: physical is live; props chains nothing.
+            unsafe { get_props2(physical, &mut props) };
+            seen.push(format!(
+                "{} (no VK_EXT_physical_device_drm)",
+                c_name(&props.properties.device_name)
+            ));
+            continue;
+        };
+
+        let primary_matches = drm.has_primary != 0
+            && (drm.primary_major, drm.primary_minor) == (want_major, want_minor);
+        let render_matches =
+            drm.has_render != 0 && (drm.render_major, drm.render_minor) == (want_major, want_minor);
+        if !primary_matches && !render_matches {
+            seen.push(format!(
+                "{name} (drm {}:{} / {}:{})",
+                drm.primary_major, drm.primary_minor, drm.render_major, drm.render_minor
+            ));
+            continue;
+        }
+
+        let missing: Vec<&str> = REQUIRED_DEVICE_EXTENSIONS
+            .iter()
+            .filter(|e| !has_extension(&exts, e))
+            .filter_map(|e| e.to_str().ok())
+            .collect();
+        if !missing.is_empty() {
+            // The device the compositor named cannot serve: a hard, explainable
+            // failure rather than a silent fallback.
+            return Err(Error::msg(format!(
+                "device {name} matches the compositor's DRM device but lacks {}",
+                missing.join(", ")
+            )));
+        }
+
+        let Some(queue_family) = graphics_family(get_queue_families, physical) else {
+            return Err(Error::msg(format!("device {name} has no graphics queue")));
+        };
+        // The render node (no DRM master needed) is where explicit sync creates
+        // its syncobjs; `None` when the device exposes no render node.
+        let render_node = (drm.has_render != 0).then_some(drm.render_minor as u32);
+        return Ok(PickedDevice {
+            physical,
+            name,
+            queue_family,
+            render_node,
+            max_image_dimension: props.properties.limits.max_image_dimension_2d,
+        });
+    }
+
+    Err(Error::msg(format!(
+        "no vulkan device matches DRM device {want_major}:{want_minor} (saw: {})",
+        seen.join("; ")
+    )))
+}
+
+fn enumerate_extensions(
+    enumerate_exts: PfnEnumerateDeviceExtensionProperties,
+    physical: VkPhysicalDevice,
+) -> Result<Vec<VkExtensionProperties>> {
+    loop {
+        let mut count = 0u32;
+        // SAFETY: physical is live; null array means "count only".
+        check(
+            unsafe {
+                enumerate_exts(
+                    physical,
+                    core::ptr::null(),
+                    &mut count,
+                    core::ptr::null_mut(),
+                )
+            },
+            "vkEnumerateDeviceExtensionProperties (count)",
+        )?;
+        // SAFETY: zeroed VkExtensionProperties (a char array and a u32) is valid.
+        let mut exts =
+            vec![unsafe { core::mem::zeroed::<VkExtensionProperties>() }; count as usize];
+        // SAFETY: exts has room for count entries.
+        let r =
+            unsafe { enumerate_exts(physical, core::ptr::null(), &mut count, exts.as_mut_ptr()) };
+        if r == VK_INCOMPLETE {
+            continue;
+        }
+        check(r, "vkEnumerateDeviceExtensionProperties")?;
+        exts.truncate(count as usize);
+        return Ok(exts);
+    }
+}
+
+/// The first queue family with graphics support, if any.
+fn graphics_family(
+    get_queue_families: PfnGetPhysicalDeviceQueueFamilyProperties,
+    physical: VkPhysicalDevice,
+) -> Option<u32> {
+    let mut count = 0u32;
+    // SAFETY: physical is live; null array means "count only".
+    unsafe { get_queue_families(physical, &mut count, core::ptr::null_mut()) };
+    // SAFETY: zeroed VkQueueFamilyProperties (plain integers) is valid.
+    let mut families =
+        vec![unsafe { core::mem::zeroed::<VkQueueFamilyProperties>() }; count as usize];
+    // SAFETY: families has room for count entries.
+    unsafe { get_queue_families(physical, &mut count, families.as_mut_ptr()) };
+    families
+        .iter()
+        .take(count as usize)
+        .position(|f| f.queue_flags & VK_QUEUE_GRAPHICS_BIT != 0 && f.queue_count > 0)
+        .map(|i| i as u32)
+}
+
+fn create_logical_device(
+    create_device: PfnCreateDevice,
+    gdpa: PfnGetDeviceProcAddr,
+    physical: VkPhysicalDevice,
+    queue_family: u32,
+) -> Result<Device> {
+    let priority = 1.0f32;
+    let queue_info = VkDeviceQueueCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        queue_family_index: queue_family,
+        queue_count: 1,
+        p_queue_priorities: &priority,
+    };
+    let ext_ptrs: Vec<*const c_char> = REQUIRED_DEVICE_EXTENSIONS
+        .iter()
+        .map(|e| e.as_ptr())
+        .collect();
+    let info = VkDeviceCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        queue_create_info_count: 1,
+        p_queue_create_infos: &queue_info,
+        enabled_layer_count: 0,
+        pp_enabled_layer_names: core::ptr::null(),
+        enabled_extension_count: ext_ptrs.len() as u32,
+        pp_enabled_extension_names: ext_ptrs.as_ptr(),
+        p_enabled_features: core::ptr::null(),
+    };
+    let mut raw: VkDevice = core::ptr::null_mut();
+    // SAFETY: physical is live; info and everything it points at outlive the call.
+    check(
+        unsafe { create_device(physical, &info, core::ptr::null(), &mut raw) },
+        "vkCreateDevice",
+    )?;
+    // As with the instance: fetch the destructor first, so later failures
+    // tear the device down through Drop.
+    let destroy: PfnDestroyDevice = unsafe { load_device(gdpa, raw, c"vkDestroyDevice") }?;
+    Ok(Device { raw, destroy })
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ffi::c_char;
+
+    use crate::render::vulkan::abi::*;
+    use crate::render::vulkan::{c_name, pick_memory_type, usable_modifiers};
+
+    const HOST: u32 = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const STORE: u32 = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    const VIEW: u32 =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+
+    fn modifier(
+        drm_format_modifier: u64,
+        planes: u32,
+        features: u32,
+    ) -> VkDrmFormatModifierPropertiesEXT {
+        VkDrmFormatModifierPropertiesEXT {
+            drm_format_modifier,
+            drm_format_modifier_plane_count: planes,
+            drm_format_modifier_tiling_features: features,
+        }
+    }
+
+    fn usable(
+        store: Vec<VkDrmFormatModifierPropertiesEXT>,
+        view: &[VkDrmFormatModifierPropertiesEXT],
+    ) -> Vec<u64> {
+        usable_modifiers(store, view)
+            .iter()
+            .map(|m| m.drm_format_modifier)
+            .collect()
+    }
+
+    #[test]
+    fn a_modifier_needs_the_srgb_view_to_draw_and_blend() {
+        let store = (1..=4).map(|m| modifier(m, 1, STORE)).collect();
+        let view = [
+            modifier(1, 1, VIEW),
+            modifier(2, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT),
+            modifier(3, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT),
+        ];
+        // 2 cannot blend, 3 cannot be drawn into, and the view does not offer 4 at all.
+        assert_eq!(usable(store, &view), [1]);
+    }
+
+    #[test]
+    fn a_modifier_needs_one_plane_it_can_draw_into_and_no_transfer_support() {
+        let store = vec![
+            modifier(1, 1, STORE),
+            modifier(2, 2, STORE),
+            modifier(3, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT),
+        ];
+        let view: Vec<_> = (1..=3).map(|m| modifier(m, 1, VIEW)).collect();
+        // 1 offers no transfer feature in either direction and still serves:
+        // nothing copies into or out of a swap image. 2 has two planes, and 3
+        // cannot be an attachment in the format the image is created with.
+        assert_eq!(usable(store, &view), [1]);
+    }
+
+    #[test]
+    fn memory_type_picking_prefers_device_local() {
+        let types = [0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, HOST];
+        assert_eq!(
+            pick_memory_type(&types, 0b111, 0),
+            Some(1),
+            "device-local wins"
+        );
+        assert_eq!(
+            pick_memory_type(&types, 0b101, 0),
+            Some(0),
+            "fallback to first allowed"
+        );
+        assert_eq!(pick_memory_type(&types, 0, 0), None);
+        // A mask bit past the device's last type names nothing.
+        assert_eq!(pick_memory_type(&types, 0b1000, 0), None);
+    }
+
+    #[test]
+    fn a_required_memory_type_has_every_flag_and_no_fallback() {
+        let types = [
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | HOST,
+            HOST,
+        ];
+        // Type 1 is host-visible but not coherent; device-local earns no preference.
+        assert_eq!(pick_memory_type(&types, 0b1111, HOST), Some(2));
+        assert_eq!(pick_memory_type(&types, 0b1011, HOST), Some(3));
+        // An allowed type that misses a required flag is never a stand-in.
+        assert_eq!(pick_memory_type(&types, 0b0011, HOST), None);
+    }
+
+    #[test]
+    fn c_name_stops_at_the_nul() {
+        let mut bytes = [0 as c_char; 8];
+        for (dst, src) in bytes.iter_mut().zip(b"abc\0zzz") {
+            *dst = *src as c_char;
+        }
+        assert_eq!(c_name(&bytes), "abc");
+        // No NUL at all: the whole array is the name.
+        let full = [b'x' as c_char; 4];
+        assert_eq!(c_name(&full), "xxxx");
+    }
+}

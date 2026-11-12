@@ -1,0 +1,10 @@
+# Build artifacts
+debug/
+target/
+.cargo/
+
+# Release output
+dist/
+
+# Per-run perf output; the committed baseline (perf/baseline.txt) stays tracked.
+perf/latest.txt
