@@ -1,4 +1,5 @@
-.PHONY: fmt clippy build build-release build-linux install run run-release test check perf perf-save perf-lab tables shaders test-ui bump clean
+.PHONY: fmt fmt-check clippy build build-release build-linux install run run-release test \
+	test-install test-abi check perf perf-save perf-lab tables shaders test-ui bump clean
 
 APP_NAME := bnkfiles
 APP_ID := io.github.borgenk.BnkFiles
@@ -8,8 +9,15 @@ LINUX_TARGET := x86_64-unknown-linux-gnu
 BIN_DIR := ~/.local/bin
 APPS_DIR := ~/.local/share/applications
 
+# The oldest glibc a downloaded tarball runs on, which is Debian 12's. The
+# release builds in that image and checks the binary against this.
+GLIBC_FLOOR := 2.36
+
 fmt:
 	cargo fmt
+
+fmt-check:
+	cargo fmt --check
 
 clippy:
 	cargo clippy --all --benches --tests --examples --all-features -- -D warnings
@@ -32,6 +40,7 @@ install: build-release
 	@echo "Installed desktop entry to ~/.local/share/applications/"
 
 # Bump version, commit, and tag: make bump V=0.2.0
+# The release workflow rejects a tag that does not match this version.
 bump:
 	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
 	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
@@ -48,6 +57,7 @@ build-linux: TARBALL := $(APP_NAME)-v$(VERSION)-$(LINUX_TARGET).tar.gz
 build-linux:
 	RUSTFLAGS="--remap-path-prefix=$(HOME)=[home]" \
 		cargo build --release --target $(LINUX_TARGET)
+	sh .github/scripts/check-abi.sh $(GLIBC_FLOOR) target/$(LINUX_TARGET)/release/$(APP_NAME)
 	rm -rf dist/stage
 	mkdir -p dist/stage
 	cp target/$(LINUX_TARGET)/release/$(APP_NAME) dist/stage/$(APP_NAME)
@@ -70,6 +80,14 @@ run-release:
 
 test:
 	cargo test
+
+# The installer, over file:// URLs, with no network.
+test-install:
+	sh .github/scripts/test-install.sh
+
+# The ABI floor check, against binaries this machine already has.
+test-abi:
+	sh .github/scripts/test-abi.sh
 
 # Run the offline performance gate (src/dev/perf.rs) with the counting allocator
 # on, so it reports allocations per operation. Always release: debug numbers are
@@ -106,7 +124,7 @@ shaders:
 test-ui:
 	cargo test --test ui -- --ignored
 
-check: fmt clippy test
+check: fmt clippy test test-install test-abi
 
 clean:
 	cargo clean

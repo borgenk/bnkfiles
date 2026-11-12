@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare tag against Cargo.toml
+        run: |
+          cargo_version="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$cargo_version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+  gate:
+    name: Gate
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build and publish
+    needs: gate
+    runs-on: ubuntu-24.04
+    # Build inside Debian 12, so the binary needs no glibc newer than its 2.36.
+    container: debian:12
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            make \
+            libfreetype-dev \
+            libharfbuzz-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build release tarball
+        run: make build-linux
+
+      - name: Check what the shipped binary links
+        run: |
+          bin=target/x86_64-unknown-linux-gnu/release/bnkfiles
+          if [ ! -f "$bin" ]; then
+            echo "::error::$bin not found, the build layout moved"
+            exit 1
+          fi
+          needed=$(readelf -d "$bin" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          echo "$needed"
+          for lib in libfontconfig libfreetype libharfbuzz libxkbcommon; do
+            if ! echo "$needed" | grep -q "^$lib"; then
+              echo "::error::the binary does not link $lib"
+              exit 1
+            fi
+          done
+          if echo "$needed" | grep -q '^libvulkan'; then
+            echo "::error::the binary links libvulkan, which has to stay dlopened"
+            exit 1
+          fi
+
+      - name: Verify the archive holds what install.sh expects
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          listing="$RUNNER_TEMP/listing"
+          tar tzf "dist/bnkfiles-v$version-x86_64-unknown-linux-gnu.tar.gz" > "$listing"
+          cat "$listing"
+          for path in ./bnkfiles ./io.github.borgenk.BnkFiles.desktop; do
+            if ! grep -qx -- "$path" "$listing"; then
+              echo "::error::the archive is missing $path"
+              exit 1
+            fi
+          done
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true

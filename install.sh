@@ -9,6 +9,21 @@ set -eu
 REPO="borgenk/bnkfiles"
 APP_ID="io.github.borgenk.BnkFiles"
 
+# Pick the downloader. curl also takes file:// URLs, which is what lets the
+# installer test drive this path with no network.
+select_fetch() {
+    if command -v curl > /dev/null 2>&1; then
+        fetch() { curl -fsSL "$1" -o "$2"; }
+        fetch_stdout() { curl -fsSL "$1"; }
+    elif command -v wget > /dev/null 2>&1; then
+        fetch() { wget -q "$1" -O "$2"; }
+        fetch_stdout() { wget -q "$1" -O -; }
+    else
+        echo "Error: curl or wget is required"
+        return 1
+    fi
+}
+
 # The download's sha256, or non-zero when the machine has nothing to compute it
 # with.
 sha256_of() {
@@ -85,16 +100,7 @@ main() {
             ;;
     esac
 
-    if command -v curl > /dev/null 2>&1; then
-        fetch() { curl -fsSL "$1" -o "$2"; }
-        fetch_stdout() { curl -fsSL "$1"; }
-    elif command -v wget > /dev/null 2>&1; then
-        fetch() { wget -q "$1" -O "$2"; }
-        fetch_stdout() { wget -q "$1" -O -; }
-    else
-        echo "Error: curl or wget is required"
-        exit 1
-    fi
+    select_fetch || exit 1
 
     if [ -n "${BNKFILES_VERSION:-}" ]; then
         VERSION="$BNKFILES_VERSION"
@@ -127,6 +133,11 @@ main() {
 
     echo "Extracting..."
     tar -xzf "$TMP_DIR/$FILENAME" -C "$TMP_DIR"
+
+    if [ ! -f "$TMP_DIR/bnkfiles" ]; then
+        echo "Error: the archive holds no bnkfiles binary"
+        exit 1
+    fi
 
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "$INSTALL_DIR"
@@ -167,4 +178,7 @@ main() {
     fi
 }
 
-main "$@"
+# Sourced as a library by the installer test, run otherwise.
+if [ "${BNKFILES_INSTALL_LIB:-}" != "1" ]; then
+    main "$@"
+fi
